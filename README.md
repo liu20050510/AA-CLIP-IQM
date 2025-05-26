@@ -1,12 +1,7 @@
 # AA-CLIP: Enhancing Zero-shot Anomaly Detection via Anomaly-Aware CLIP
  **[CVPR 2025 paper]**
 
-[![Paper](https://img.shields.io/badge/CVPR-Paper-red)](https://arxiv.org/pdf/2503.06661) 
-<!-- [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://your-project-page.com) 
-[![GitHub Stars](https://img.shields.io/github/stars/yourusername/repo?style=social)](https://github.com/yourusername/repo)   -->
-[![Appendix](https://img.shields.io/badge/CVPR-Appendix-red)](https://drive.google.com/file/d/1PQrjCvWDyuM7W2ClJ-cJeD4YKJ1uPAzc/view?usp=drive_link)
-<!-- [![Project Page](https://img.shields.io/badge/Project-Page-blue)](https://your-project-page.com) 
-[![GitHub Stars](https://img.shields.io/github/stars/yourusername/repo?style=social)](https://github.com/yourusername/repo)   -->
+[![Paper](https://img.shields.io/badge/CVPR-Paper-red)](https://arxiv.org/pdf/2503.06661) [![Appendix](https://img.shields.io/badge/CVPR-Appendix-blue)](https://drive.google.com/file/d/1PQrjCvWDyuM7W2ClJ-cJeD4YKJ1uPAzc/view?usp=drive_link)
  Official Pytorch Implementation
 
 ![](pic/teaser.png)
@@ -46,8 +41,17 @@ The way of creating corresponding jsonl file differs, depending on the file stru
 ```bash
 # training
 python train.py --shot $shot --save_path $save_path
+python train.py --training_mode full_shot --dataset MVTec --save_path ckpt/mvtec_change1.0
 # evaluation
 python test.py --save_path $save_path --dataset $dataset
+# test_single_image
+python single_image_test.py `
+--image_path "D:\2019alitianchibei\dataset\xuelang_round1_train_part1_20180628\train_images\J01_2018.06.19 14_04_30.jpg" `
+--class_name carpet `
+--save_path ckpt/mvtec `
+--model_name ViT-L-14-336 `
+--img_size 518 `
+--visualize
 # (Optional) we provide bash script for training and evaluating all the datasets
 bash scripts.sh
 ```
