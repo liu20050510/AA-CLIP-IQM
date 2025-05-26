@@ -1,4 +1,4 @@
-BASE_PATH = "/data/wenxinma"
+BASE_PATH = "."
 DATA_PATH = {
     "Brain": f"{BASE_PATH}/data/MedAD/Brain_AD",
     "Liver": f"{BASE_PATH}/data/MedAD/Liver_AD",
@@ -9,7 +9,7 @@ DATA_PATH = {
     "Colon_Kvasir": f"{BASE_PATH}/data/Colon/Kvasir",
     "BTAD": f"{BASE_PATH}/data/BTech_Dataset_transformed",
     "MPDD": f"{BASE_PATH}/data/MPDD",
-    "MVTec": f"{BASE_PATH}/data/mvtec_ad",
+    "MVTec": f"{BASE_PATH}/data/MVTec-AD",
     "VisA": f"{BASE_PATH}/data/VisA_20220922",
 }
 

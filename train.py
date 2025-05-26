@@ -195,10 +195,10 @@ def main():
         choices=["few_shot", "full_shot"],
     )
     parser.add_argument("--shot", type=int, default=32, help="number of shots (0 means full shot)")
-    parser.add_argument("--text_batch_size", type=int, default=16)
-    parser.add_argument("--image_batch_size", type=int, default=2)
+    parser.add_argument("--text_batch_size", type=int, default=2)
+    parser.add_argument("--image_batch_size", type=int, default=1)
     parser.add_argument("--text_epoch", type=int, default=5, help="epochs for stage1")
-    parser.add_argument("--image_epoch", type=int, default=20, help="epochs for stage2")
+    parser.add_argument("--image_epoch", type=int, default=3, help="epochs for stage2")
     parser.add_argument("--text_lr", type=float, default=0.00001, help="learning rate for stage1")
     parser.add_argument("--image_lr", type=float, default=0.0005, help="learning rate for stage2")
     parser.add_argument(
