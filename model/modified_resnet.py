@@ -1,1 +1,1 @@
-from model.versions.modified_resnet_v5_0 import ModifiedResNet
+from model.versions.modified_resnet_origin import ModifiedResNet

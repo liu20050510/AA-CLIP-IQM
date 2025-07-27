@@ -1,4 +1,4 @@
-# 引入整个MSCN
+# 引入魔改后的模块MSGI_FCM（多尺度组间交互融合模块）
 
 from collections import OrderedDict
 
@@ -6,225 +6,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torchvision.ops import FrozenBatchNorm2d
-from einops import rearrange
-from math import sqrt
-import cv2
-from torchvision.models import resnet34, resnet50
 
-class ChannelAttention(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(in_channels, in_channels // reduction_ratio),
-            nn.ReLU(),
-            nn.Linear(in_channels // reduction_ratio, in_channels),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        avg_out = self.avg_pool(x).view(x.size(0), -1)
-        channel_attention = self.fc(avg_out).view(x.size(0), x.size(1), 1, 1)
-        return x * channel_attention
-
-
-class SpatialAttention(nn.Module):
-    def __init__(self, in_channels):
-        super(SpatialAttention, self).__init__()
-        self.conv = nn.Conv2d(in_channels, 1, kernel_size=1)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, x):
-        attention = self.conv(x)
-        attention = self.sigmoid(attention)
-        x = x * attention
-        return x
-
-
-class CBAM(nn.Module):
-    def __init__(self, in_channels, reduction_ratio=4):
-        super(CBAM, self).__init__()
-        self.channel_attention = ChannelAttention(in_channels, reduction_ratio)
-        self.spatial_attention = SpatialAttention(in_channels)
-
-    def forward(self, x):
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-
-class GroupCBAMEnhancer(nn.Module):
-    def __init__(self, channel, group=8, cov1=1, cov2=1):
-        super().__init__()
-        self.cov1 = None
-        self.cov2 = None
-        if cov1 != 0:
-            self.cov1 = nn.Conv2d(channel, channel, kernel_size=1)
-        self.group = group
-        cbam = []
-        for i in range(self.group):
-            cbam_ = CBAM(channel // group)
-            cbam.append(cbam_)
-
-        self.cbam = nn.ModuleList(cbam)
-        self.sigomid = nn.Sigmoid()
-        if cov2 != 0:
-            self.cov2 = nn.Conv2d(channel, channel, kernel_size=1)
-
-    def forward(self, x):
-        x0 = x
-        if self.cov1 != None:
-            x = self.cov1(x)
-        y = torch.split(x, x.size(1) // self.group, dim=1)
-        mask = []
-        for y_, cbam in zip(y, self.cbam):
-            y_ = cbam(y_)
-            y_ = self.sigomid(y_)
-
-            mk = y_
-
-            mean = torch.mean(y_, [1, 2, 3])
-            mean = mean.view(-1, 1, 1, 1)
-
-            gate = torch.ones_like(y_) * mean
-            mk = torch.where(y_ > gate, 1, y_)
-
-            mask.append(mk)
-        mask = torch.cat(mask, dim=1)
-        x = x * mask
-        if self.cov2 != None:
-            x = self.cov2(x)
-        x = x + x0
-        return x
-
-class MSC(nn.Module):
-    def __init__(self, dim, num_heads=8, topk=True, kernel=[3, 5, 7], s=[1, 1, 1], pad=[1, 2, 3],
-                 qkv_bias=False, qk_scale=None, attn_drop_ratio=0., proj_drop_ratio=0., k1=2, k2=3):
-        super(MSC, self).__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = qk_scale or head_dim ** -0.5
-
-        self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop_ratio)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop_ratio)
-        self.k1 = k1
-        self.k2 = k2
-
-        self.attn1 = torch.nn.Parameter(torch.tensor([0.5]), requires_grad=True)
-        self.attn2 = torch.nn.Parameter(torch.tensor([0.5]), requires_grad=True)
-
-        self.avgpool1 = nn.AvgPool2d(kernel_size=kernel[0], stride=s[0], padding=pad[0])
-        self.avgpool2 = nn.AvgPool2d(kernel_size=kernel[1], stride=s[1], padding=pad[1])
-        self.avgpool3 = nn.AvgPool2d(kernel_size=kernel[2], stride=s[2], padding=pad[2])
-
-        self.layer_norm = nn.LayerNorm(dim)
-
-        self.topk = topk  # False True
-
-    def forward(self, x, y):
-        y1 = self.avgpool1(y)
-        y2 = self.avgpool2(y)
-        y3 = self.avgpool3(y)
-        y = y1 + y2 + y3
-        y = y.flatten(-2, -1)
-
-        y = y.transpose(1, 2)
-        y = self.layer_norm(y)
-        x = rearrange(x, 'b c h w -> b (h w) c')
-        B, N1, C = y.shape
-        kv = self.kv(y).reshape(B, N1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
-        B, N, C = x.shape
-        q = self.q(x).reshape(B, N, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-
-        mask1 = torch.zeros(B, self.num_heads, N, N1, device=x.device, requires_grad=False)
-        index = torch.topk(attn, k=int(N1 / self.k1), dim=-1, largest=True)[1]
-        mask1.scatter_(-1, index, 1.)
-        attn1 = torch.where(mask1 > 0, attn, torch.full_like(attn, float('-inf')))
-        attn1 = attn1.softmax(dim=-1)
-        attn1 = self.attn_drop(attn1)
-        out1 = (attn1 @ v)
-
-        mask2 = torch.zeros(B, self.num_heads, N, N1, device=x.device, requires_grad=False)
-        index = torch.topk(attn, k=int(N1 / self.k2), dim=-1, largest=True)[1]
-        mask2.scatter_(-1, index, 1.)
-        attn2 = torch.where(mask2 > 0, attn, torch.full_like(attn, float('-inf')))
-        attn2 = attn2.softmax(dim=-1)
-        attn2 = self.attn_drop(attn2)
-        out2 = (attn2 @ v)
-
-        out = out1 * self.attn1 + out2 * self.attn2
-        x = out.transpose(1, 2).reshape(B, N, C)
-
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        hw = int(sqrt(N))
-        x = rearrange(x, 'b (h w) c -> b c h w', h=hw, w=hw)
-        return x
-
-class MSCN(nn.Module):
-    def __init__(self, num_classes=45, res=50, k1=2, k2=3, g=8):
-        super(MSCN, self).__init__()
-        if res == 34:
-            self.resnet = resnet34()
-            dim = [64, 128, 256, 512]
-            self.dim = dim
-        elif res == 50:
-            self.resnet = resnet50()
-            dim = [256, 512, 1024, 2048]
-            self.dim = dim
-        dim_b = self.dim[1]
-        dim_fc = self.dim[-1]
-
-        self.msc1 = MSC(dim=dim_b, kernel=[3, 5, 7], pad=[1, 2, 3], k1=k1, k2=k2)
-        self.msc2 = MSC(dim=dim_b, kernel=[3, 5, 7], pad=[1, 2, 3], k1=k1, k2=k2)
-        self.msc3 = MSC(dim=dim_b, kernel=[3, 5, 7], pad=[1, 2, 3], k1=k1, k2=k2)
-
-        self.gce = GroupCBAMEnhancer(dim_fc, g, 0, 0)
-
-        self.cov1 = nn.Conv2d(dim[0], dim_b, 3, 2, 1)
-        self.cov2 = nn.Conv2d(dim[1], dim_b, 3, 2, 1)
-        self.cov3 = nn.Conv2d(dim[2], dim_b, 3, 2, 1)
-        self.cov4 = nn.Conv2d(dim[3], dim_b, 1)
-
-        self.avgpool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(dim_fc, num_classes)
-
-    def reset_head(self, num_classes):
-        self.fc = nn.Linear(self.dim[-1], num_classes)
-
-    def forward(self, x):
-        x = self.resnet.conv1(x)
-        x = self.resnet.bn1(x)
-        x = self.resnet.relu(x)
-        x = self.resnet.maxpool(x)
-        x = self.resnet.layer1(x)
-        x1 = self.cov1(x)
-        x = self.resnet.layer2(x)
-        x2 = self.cov2(x)
-        x = self.resnet.layer3(x)
-        x3 = self.cov3(x)
-        x = self.resnet.layer4(x)
-        x4 = self.cov4(x)
-
-        x1 = self.msc1(x4, x1)
-        x2 = self.msc2(x4, x2)
-        x3 = self.msc3(x4, x3)
-
-        x = torch.cat([x4, x1, x2, x3], dim=1)
-        x = self.gce(x)
-
-        x = self.avgpool(x)
-
-        x = torch.flatten(x, 1)
-        x = self.fc(x)
-
-        return x
 
 def freeze_batch_norm_2d(module, module_match={}, name=''):
     """
@@ -263,6 +45,7 @@ def freeze_batch_norm_2d(module, module_match={}, name=''):
             if new_child is not child:
                 res.add_module(child_name, new_child)
     return res
+
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -311,6 +94,7 @@ class Bottleneck(nn.Module):
         out = self.act3(out)
         return out
 
+
 class AttentionPool2d(nn.Module):
     def __init__(self, spacial_dim: int, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
@@ -347,6 +131,89 @@ class AttentionPool2d(nn.Module):
 
         return x[0]
 
+
+def autopad(k, p=None, d=1):
+    if d > 1:
+        k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]
+    if p is None:
+        p = k // 2 if isinstance(k, int) else [x // 2 for x in k]
+    return p
+
+
+class Conv(nn.Module):
+    default_act = nn.SiLU()
+
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        super().__init__()
+        self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, dim, reduction=16):
+        super().__init__()
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // reduction, dim, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, 1, kernel_size=7, padding=3, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        sa = self.sigmoid(self.conv(x))
+        return x * sa
+
+
+class MSGI_FCM(nn.Module):
+    def __init__(self, dim, dim_out):
+        super().__init__()
+        # 多尺度分支
+        self.conv1 = Conv(dim, dim // 2, k=1)
+        self.conv3 = Conv(dim, dim // 2, k=3)
+        self.conv5 = Conv(dim, dim // 2, k=5)
+        self.merge = Conv(dim // 2 * 3, dim, k=1)
+
+        # 注意力模块
+        self.channel_attn = ChannelAttention(dim)
+        self.spatial_attn = SpatialAttention(dim)
+
+        # 输出整合
+        self.out_conv = Conv(dim, dim_out, k=1)
+        self.residual = nn.Identity() if dim == dim_out else Conv(dim, dim_out, k=1)
+
+    def forward(self, x):
+        x1 = self.conv1(x)
+        x3 = self.conv3(x)
+        x5 = self.conv5(x)
+
+        multi_scale = torch.cat([x1, x3, x5], dim=1)
+        x_mixed = self.merge(multi_scale)
+
+        x_c = self.channel_attn(x_mixed)
+        x_s = self.spatial_attn(x_mixed)
+
+        out = self.out_conv(x_c + x_s)
+        return out + self.residual(x)
+
+
 class ModifiedResNet(nn.Module):
     """
     A ResNet class that is similar to torchvision's but contains the following changes:
@@ -355,7 +222,7 @@ class ModifiedResNet(nn.Module):
     - The final pooling layer is a QKV attention instead of an average pool
     """
 
-    def __init__(self, layers, output_dim, heads, image_size=224, width=64, num_classes=45, res=50, k1=2, k2=3, g=8):
+    def __init__(self, layers, output_dim, heads, image_size=224, width=64):
         super().__init__()
         self.output_dim = output_dim
         self.image_size = image_size
@@ -379,10 +246,11 @@ class ModifiedResNet(nn.Module):
         self.layer3 = self._make_layer(width * 4, layers[2], stride=2)
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
+        # Insert MSGI_FCM module after layer4
         embed_dim = width * 32  # the ResNet feature dimension
-        self.attnpool = AttentionPool2d(image_size // 32, embed_dim, heads, output_dim)
+        self.msgi_fcm = MSGI_FCM(dim=embed_dim, dim_out=embed_dim)
 
-        self.mscn = MSCN(num_classes, res, k1, k2, g)
+        self.attnpool = AttentionPool2d(image_size // 32, embed_dim, heads, output_dim)
 
         self.init_parameters()
 
@@ -433,18 +301,8 @@ class ModifiedResNet(nn.Module):
         x = self.layer2(x)
         x = self.layer3(x)
         x = self.layer4(x)
+        # Apply MSGI_FCM module
+        x = self.msgi_fcm(x)
         x = self.attnpool(x)
 
-        # 使用 MSCN 模块
-        mscn_output = self.mscn(x.unsqueeze(2).unsqueeze(3))
-
-        return mscn_output
-
-if __name__ == '__main__':
-    print('net test')
-    a = torch.randn(1, 3, 224, 224)
-    model = ModifiedResNet(layers=[3, 4, 6, 3], output_dim=1024, heads=8)
-    total = sum([param.nelement() for param in model.parameters()])
-    print("Number of parameter: %.2fM" % (total / 1e6))
-    b = model(a)
-    print(b.shape)
+        return x
