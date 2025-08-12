@@ -365,6 +365,7 @@ def build_model_from_openai_state_dict(
 
     convert_weights_to_fp16(model)  # OpenAI state dicts are partially converted to float16
     model.load_state_dict(state_dict)
+    # model.load_state_dict(state_dict, strict=False)
     return model.eval()
 
 

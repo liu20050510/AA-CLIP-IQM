@@ -77,7 +77,7 @@ def get_predictions(
         # get text
         epoch_text_feature = class_text_embeddings
         # forward image
-        patch_features, det_feature = model(image)
+        patch_features, det_feature = model(image, text_feat=epoch_text_feature.unsqueeze(-1))  # 修改此处
         # calculate similarity and get prediction
         # cls_preds = []
         pred = det_feature @ epoch_text_feature
