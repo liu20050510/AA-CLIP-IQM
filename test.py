@@ -10,7 +10,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-
 from utils import setup_seed, cos_sim
 from model.adapter import AdaptedCLIP
 from model.clip import create_model
@@ -51,12 +50,12 @@ def get_support_features(model, support_loader, device):
 
 
 def get_predictions(
-    model: nn.Module,
-    class_text_embeddings: torch.Tensor,
-    test_loader: DataLoader,
-    device: str,
-    img_size: int,
-    dataset: str = "MVTec",
+        model: nn.Module,
+        class_text_embeddings: torch.Tensor,
+        test_loader: DataLoader,
+        device: str,
+        img_size: int,
+        dataset: str = "MVTec",
 ):
     masks = []
     labels = []
@@ -76,10 +75,17 @@ def get_predictions(
         file_names.extend(file_name)
         # get text
         epoch_text_feature = class_text_embeddings
-        # forward image
-        patch_features, det_feature = model(image, text_feat=epoch_text_feature.unsqueeze(-1))  # 修改此处
+
+        # 修复：正确获取异常文本向量
+        # 文本嵌入形状为 (2, 768) - 第一个是正常文本，第二个是异常文本
+        text_feat_batch = epoch_text_feature[1]  # 直接取第二个元素（异常文本向量）
+        text_feat_batch = text_feat_batch.unsqueeze(0)  # [1, 768]
+        text_feat_batch = text_feat_batch.expand(image.size(0), -1)  # [B, 768]
+
+        # forward image (传入文本特征)
+        patch_features, det_feature = model(image, text_feat=text_feat_batch)
+
         # calculate similarity and get prediction
-        # cls_preds = []
         pred = det_feature @ epoch_text_feature
         pred = (pred[:, 1] + 1) / 2
         preds_image.append(pred.cpu().numpy())
@@ -244,12 +250,13 @@ def main():
                 domain=DOMAINS[args.dataset],
             )
             df.loc[len(df)] = Series(class_result_dict)
-        # df.loc[len(df)] = df.mean()
+        # 仅对数值列计算平均值
         numeric_cols = ["pixel AUC", "pixel AP", "image AUC", "image AP"]
-        mean_values = df[numeric_cols].mean().to_dict()
-        mean_values["class name"] = "Average"
-        df.loc[len(df)] = Series(mean_values)
-        df.loc[len(df) - 1]["class name"] = "Average"
+        average_row = df[numeric_cols].mean()
+        # 添加"Average"作为类别名称
+        average_row["class name"] = "Average"
+        # 插入平均值行
+        df.loc[len(df)] = average_row
         logger.info("final results:\n%s", df.to_string(index=False, justify="center"))
 
 

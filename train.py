@@ -21,7 +21,6 @@ from forward_utils import (
     calculate_seg_loss,
 )
 import warnings
-from model.tokenizer import tokenize
 
 warnings.filterwarnings("ignore")
 
@@ -116,17 +115,17 @@ def train_text_adapter(
 
 
 def train_image_adapter(
-        model: nn.Module,
-        text_embeddings: torch.Tensor,
-        train_loader: DataLoader,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler,
-        device: str,
-        start_epoch: int,
-        save_path: str,
-        image_epoch: int,
-        img_size: int,
-        logger: logging.Logger,
+    model: nn.Module,
+    text_embeddings: torch.Tensor,
+    train_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler,
+    device: str,
+    start_epoch: int,
+    save_path: str,
+    image_epoch: int,
+    img_size: int,
+    logger: logging.Logger,
 ):
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
@@ -142,14 +141,8 @@ def train_image_adapter(
                 [text_embeddings[class_name] for class_name in class_names], dim=0
             )
 
-            # 获取文本特征用于融合
-            text_tokens = [model.encode_text(tokenize([name]).to(device)) for name in class_names]
-            text_feat = torch.cat(text_tokens, dim=0)  # [batch_size, 768]
-            text_feat = text_feat.unsqueeze(-1)  # [batch_size, 768, 1] -> 3维张量
-
-            # 传入文本特征进行双向融合
-            patch_features, det_feature = model(image, text_feat=text_feat)
-
+            # forward image
+            patch_features, det_feature = model(image)
             # calculate similarity and get prediction
             loss = 0.0
             det_feature = det_feature.unsqueeze(1)
@@ -170,7 +163,6 @@ def train_image_adapter(
             "epoch": epoch + 1,
             "image_adapter": model.image_adapter.state_dict(),
             "image_optimizer": optimizer.state_dict(),
-            "fusion_module": model.bi_fusion.state_dict(),  # 保存融合模块参数
         }
         torch.save(model_dict, os.path.join(save_path, "image_adapter.pth"))
         if (epoch + 1) % 1 == 0:
@@ -206,7 +198,7 @@ def main():
     parser.add_argument("--text_batch_size", type=int, default=2)
     parser.add_argument("--image_batch_size", type=int, default=1)
     parser.add_argument("--text_epoch", type=int, default=5, help="epochs for stage1")
-    parser.add_argument("--image_epoch", type=int, default=5, help="epochs for stage2")
+    parser.add_argument("--image_epoch", type=int, default=6, help="epochs for stage2")
     parser.add_argument("--text_lr", type=float, default=0.00001, help="learning rate for stage1")
     parser.add_argument("--image_lr", type=float, default=0.0005, help="learning rate for stage2")
     parser.add_argument(

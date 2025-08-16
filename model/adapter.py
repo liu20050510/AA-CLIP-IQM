@@ -1,75 +1,42 @@
-# AA-CLIP/model/adapter.py
 import torch
 from torch import nn
 import torch.nn.functional as F
 from .adapter_modules import SimpleAdapter, SimpleProj
 
 
-# 导入LightBiMAFusion模块
-class LightBiMAFusion(nn.Module):
-    """
-    LightBiMAFusion: 轻量化双向模态融合模块
-    - 高分辨率输入支持（如 256×256）
-    - 注意力仅在低分辨率上计算，节省显存
-    - 支持图像语义双向融合
-    """
+# 交叉模态注意力模块
+class CrossModelAtt(nn.Module):
+    def __init__(self, feature_dim, height, width):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.zeros(1))  # 可学习的参数
+        self.softmax = nn.Softmax(dim=-1)  # Softmax 用于归一化注意力权重
+        self.height = height
+        self.width = width
 
-    def __init__(self, img_channels, txt_channels, mid_channels=64, attn_size=64):
-        super(LightBiMAFusion, self).__init__()
-        self.attn_size = attn_size
+    def forward(self, img_feat, text_feat):
+        # img_feat: [B, C, H, W]
+        # text_feat: [B, C, H, W]
+        B, C, H, W = img_feat.shape
 
-        self.img_proj = nn.Conv2d(img_channels, mid_channels, kernel_size=1)
-        self.txt_proj = nn.Conv2d(txt_channels, mid_channels, kernel_size=1)
+        # 特征图展平
+        q = img_feat.view(B, C, -1)  # [B, C, H*W]
+        k = text_feat.view(B, C, -1).permute(0, 2, 1)  # [B, H*W, C]
 
-        self.gamma_img2txt = nn.Parameter(torch.zeros(1))
-        self.gamma_txt2img = nn.Parameter(torch.zeros(1))
+        # 计算注意力感知矩阵
+        attention_map = torch.bmm(q, k)  # [B, C, C]
+        attention_map = self.softmax(attention_map)  # [B, C, C]
 
-        self.softmax = nn.Softmax(dim=-1)
+        # 融合
+        v = text_feat.view(B, C, -1)  # [B, C, H*W]
+        attention_info = torch.bmm(attention_map, v)  # [B, C, H*W]
 
-    def forward(self, img_feat, txt_feat):
-        B, _, H, W = img_feat.size()
-        target_size = (H, W)
+        # 重构为原始的H和W维度
+        attention_info = attention_info.view(B, C, H, W)
 
-        # 计算池化参数以替代自适应池化
-        stride_h = H // self.attn_size
-        kernel_h = H - (self.attn_size - 1) * stride_h
-        stride_w = W // self.attn_size
-        kernel_w = W - (self.attn_size - 1) * stride_w
+        # 加权和原特征图
+        output = self.gamma * attention_info + img_feat  # 加权融合后的结果
 
-        # 使用自适应池化到目标注意力尺寸
-        img_down = F.adaptive_avg_pool2d(img_feat, (self.attn_size, self.attn_size))
-        txt_down = F.adaptive_avg_pool2d(txt_feat, (self.attn_size, self.attn_size))
-
-        # 通道映射
-        img_proj = self.img_proj(img_down)
-        txt_proj = self.txt_proj(txt_down)
-
-        B, C, h, w = img_proj.shape
-        N = h * w
-
-        # reshape
-        Q_txt = txt_proj.view(B, C, N)
-        K_img = img_proj.view(B, C, N)
-        V_img = img_proj.view(B, C, N).permute(0, 2, 1)
-        V_txt = txt_proj.view(B, C, N).permute(0, 2, 1)
-
-        # 注意力矩阵
-        attn_img2txt = self.softmax(torch.bmm(Q_txt.permute(0, 2, 1), K_img))
-        attn_txt2img = self.softmax(torch.bmm(K_img.permute(0, 2, 1), Q_txt))
-
-        # 注意力融合
-        fusion_img = torch.bmm(attn_img2txt, V_img).permute(0, 2, 1).view(B, C, h, w)
-        fusion_txt = torch.bmm(attn_txt2img, V_txt).permute(0, 2, 1).view(B, C, h, w)
-
-        # 上采样恢复
-        fusion_img_up = F.interpolate(fusion_img, size=target_size, mode='bilinear', align_corners=False)
-        fusion_txt_up = F.interpolate(fusion_txt, size=target_size, mode='bilinear', align_corners=False)
-
-        # 残差融合
-        out_img = self.gamma_img2txt * fusion_img_up + self.txt_proj(txt_feat)
-        out_txt = self.gamma_txt2img * fusion_txt_up + self.img_proj(img_feat)
-
-        return out_img, out_txt
+        return output
 
 
 class AdaptedCLIP(nn.Module):
@@ -82,8 +49,8 @@ class AdaptedCLIP(nn.Module):
             image_adapt_until: int = 6,
             levels: list = [6, 12, 18, 24],
             relu: bool = True,
-            fusion_mid_channels: int = 64,
-            fusion_attn_size: int = 64,
+            cross_attn_height: int = 16,  # 交叉注意力特征图高度
+            cross_attn_width: int = 16,  # 交叉注意力特征图宽度
             **kwargs,
     ):
         super().__init__()
@@ -103,6 +70,14 @@ class AdaptedCLIP(nn.Module):
             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
         )
         det_proj = SimpleProj(1024, 768, relu)
+
+        # 新增：交叉模态注意力模块
+        self.cross_attn = CrossModelAtt(
+            feature_dim=1024,
+            height=cross_attn_height,
+            width=cross_attn_width
+        )
+
         self.image_adapter = nn.ModuleDict(
             {
                 "layer_adapters": layer_adapters,
@@ -117,17 +92,8 @@ class AdaptedCLIP(nn.Module):
             + [SimpleProj(768, 768, relu=True)]
         )
 
-        # 初始化双向模态融合模块
-        self.bi_fusion = LightBiMAFusion(
-            img_channels=1024,
-            txt_channels=768,
-            mid_channels=fusion_mid_channels,
-            attn_size=fusion_attn_size
-        )
-
-        # 添加融合特征投影层
-        self.fusion_proj = nn.Conv2d(fusion_mid_channels, 1024, kernel_size=1)
-
+        # 默认文本特征（用于交叉注意力）
+        self.default_text_features = None
         self._init_weights_()
 
     def _init_weights_(self):
@@ -137,14 +103,9 @@ class AdaptedCLIP(nn.Module):
         for p in self.text_adapter.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        # 初始化融合模块参数
-        for p in self.bi_fusion.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-        # 初始化融合投影层
-        nn.init.xavier_uniform_(self.fusion_proj.weight)
-        if self.fusion_proj.bias is not None:
-            nn.init.zeros_(self.fusion_proj.bias)
+        # 初始化交叉注意力参数
+        if hasattr(self, 'cross_attn'):
+            nn.init.zeros_(self.cross_attn.gamma)
 
     def forward_original(self, x, modality="visual"):
         if modality == "visual":
@@ -157,6 +118,10 @@ class AdaptedCLIP(nn.Module):
             return patch_features, cls_features
         else:
             raise ValueError("modality must be visual")
+
+    def set_default_text_features(self, text_features):
+        """设置默认文本特征，用于交叉注意力"""
+        self.default_text_features = text_features
 
     def forward(self, x, text_feat=None):
         # 图像特征提取
@@ -199,30 +164,39 @@ class AdaptedCLIP(nn.Module):
         tokens = [t.permute(1, 0, 2) for t in tokens]
         tokens = [self.image_encoder.ln_post(t) for t in tokens]
 
-        # 如果提供了文本特征，则进行双向模态融合
-        if text_feat is not None:
-            # 调整特征形状以适应融合模块 (B, N, C) -> (B, C, H, W)
-            B, N, C_img = tokens[-1].shape
-            H = W = int(N ** 0.5)
-            img_feat_2d = tokens[-1].permute(0, 2, 1).view(B, C_img, H, W)
+        # 使用交叉模态注意力（强制使用）
+        # 如果没有显式提供text_feat，则使用默认的文本特征
+        if text_feat is None:
+            text_feat = self.default_text_features
 
-            # 文本特征形状调整
-            B, C_txt, _ = text_feat.shape
-            txt_feat_2d = text_feat.unsqueeze(-1).repeat(1, 1, H, W)  # 扩展到空间维度
+            # 如果有文本特征，则应用交叉模态注意力
+            if text_feat is not None:
+                # 调整文本特征形状以匹配图像特征
+                if len(text_feat.shape) == 2:
+                    # 如果text_feat是2维的[B, C]，扩展为3维[B, C, 1]
+                    text_feat = text_feat.unsqueeze(-1)
+                B, C, _ = text_feat.shape
+                H, W = self.cross_attn.height, self.cross_attn.width
 
-            # 双向融合
-            fused_img, fused_txt = self.bi_fusion(img_feat_2d, txt_feat_2d)
+                # 将文本特征扩展为空间特征图
+                text_feat_reshaped = text_feat.unsqueeze(-1).repeat(1, 1, H * W)  # [B, C, H*W]
+                text_feat_reshaped = text_feat_reshaped.view(B, C, H, W)  # [B, C, H, W]
 
-            # 投影融合特征到原始通道数
-            fused_img = self.fusion_proj(fused_img)
-
-            # 恢复形状 (B, C, H, W) -> (B, N, C)
-            fused_img = fused_img.view(B, 1024, N).permute(0, 2, 1)
-
-            # 残差连接
-            tokens[-1] = tokens[-1] + fused_img
-
-        # 后续处理
+                # 对每个层级的图像特征应用交叉注意力
+                fused_tokens = []
+                for token in tokens:
+                    B, L, C = token.shape
+                    # 动态计算H和W，而不是使用固定的值
+                    HW = int(L ** 0.5)
+                    token_reshaped = token.permute(0, 2, 1).view(B, C, HW, HW)  # [B, C, HW, HW]
+                    # 调整text_feat_reshaped的大小以匹配token的大小
+                    text_feat_resized = F.interpolate(text_feat_reshaped, size=(HW, HW), mode='bilinear',
+                                                      align_corners=False)
+                    fused_token = self.cross_attn(token_reshaped, text_feat_resized)  # [B, C, HW, HW]
+                    fused_token = fused_token.view(B, C, L).permute(0, 2, 1)  # [B, L, C]
+                    fused_tokens.append(fused_token)
+                tokens = fused_tokens
+        # 投影到输出维度
         seg_tokens = [
             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
         ]
@@ -256,9 +230,270 @@ class AdaptedCLIP(nn.Module):
                 x = self.t_w * adapt_out + (1 - self.t_w) * x
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.clipmodel.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-        # 文本特征适配
-        txt_feat = self.text_adapter[-1](x[torch.arange(x.shape[0]), text.argmax(dim=-1)])
-        return txt_feat
+        # 应用最后的投影
+        x = self.text_adapter[-1](x[torch.arange(x.shape[0]), text.argmax(dim=-1)])
+        return x
+
+# import torch
+# from torch import nn
+# import torch.nn.functional as F
+# from .adapter_modules import SimpleAdapter, SimpleProj
+#
+#
+# # 导入LightBiMAFusion模块
+# class LightBiMAFusion(nn.Module):
+#     """
+#     LightBiMAFusion: 轻量化双向模态融合模块
+#     - 高分辨率输入支持（如 256×256）
+#     - 注意力仅在低分辨率上计算，节省显存
+#     - 支持图像语义双向融合
+#     """
+#
+#     def __init__(self, img_channels, txt_channels, mid_channels=64, attn_size=64):
+#         super(LightBiMAFusion, self).__init__()
+#         self.attn_size = attn_size
+#
+#         self.img_proj = nn.Conv2d(img_channels, mid_channels, kernel_size=1)
+#         self.txt_proj = nn.Conv2d(txt_channels, mid_channels, kernel_size=1)
+#
+#         self.gamma_img2txt = nn.Parameter(torch.zeros(1))
+#         self.gamma_txt2img = nn.Parameter(torch.zeros(1))
+#
+#         self.softmax = nn.Softmax(dim=-1)
+#
+#     def forward(self, img_feat, txt_feat):
+#         B, _, H, W = img_feat.size()
+#         target_size = (H, W)
+#
+#         # 计算池化参数以替代自适应池化
+#         stride_h = H // self.attn_size
+#         kernel_h = H - (self.attn_size - 1) * stride_h
+#         stride_w = W // self.attn_size
+#         kernel_w = W - (self.attn_size - 1) * stride_w
+#
+#         # 使用自适应池化到目标注意力尺寸
+#         img_down = F.adaptive_avg_pool2d(img_feat, (self.attn_size, self.attn_size))
+#         txt_down = F.adaptive_avg_pool2d(txt_feat, (self.attn_size, self.attn_size))
+#
+#         # 通道映射
+#         img_proj = self.img_proj(img_down)
+#         txt_proj = self.txt_proj(txt_down)
+#
+#         B, C, h, w = img_proj.shape
+#         N = h * w
+#
+#         # reshape
+#         Q_txt = txt_proj.view(B, C, N)
+#         K_img = img_proj.view(B, C, N)
+#         V_img = img_proj.view(B, C, N).permute(0, 2, 1)
+#         V_txt = txt_proj.view(B, C, N).permute(0, 2, 1)
+#
+#         # 注意力矩阵
+#         attn_img2txt = self.softmax(torch.bmm(Q_txt.permute(0, 2, 1), K_img))
+#         attn_txt2img = self.softmax(torch.bmm(K_img.permute(0, 2, 1), Q_txt))
+#
+#         # 注意力融合
+#         fusion_img = torch.bmm(attn_img2txt, V_img).permute(0, 2, 1).view(B, C, h, w)
+#         fusion_txt = torch.bmm(attn_txt2img, V_txt).permute(0, 2, 1).view(B, C, h, w)
+#
+#         # 上采样恢复
+#         fusion_img_up = F.interpolate(fusion_img, size=target_size, mode='bilinear', align_corners=False)
+#         fusion_txt_up = F.interpolate(fusion_txt, size=target_size, mode='bilinear', align_corners=False)
+#
+#         # 残差融合
+#         out_img = self.gamma_img2txt * fusion_img_up + self.txt_proj(txt_feat)
+#         out_txt = self.gamma_txt2img * fusion_txt_up + self.img_proj(img_feat)
+#
+#         return out_img, out_txt
+#
+#
+# class AdaptedCLIP(nn.Module):
+#     def __init__(
+#             self,
+#             clip_model,
+#             text_adapt_weight: float = 0.1,
+#             image_adapt_weight: float = 0.1,
+#             text_adapt_until: int = 3,
+#             image_adapt_until: int = 6,
+#             levels: list = [6, 12, 18, 24],
+#             relu: bool = True,
+#             fusion_mid_channels: int = 64,
+#             fusion_attn_size: int = 64,
+#             **kwargs,
+#     ):
+#         super().__init__()
+#         self.clipmodel = clip_model
+#         self.image_encoder = clip_model.visual
+#         self.text_adapt_until = text_adapt_until
+#         self.image_adapt_until = image_adapt_until
+#         self.t_w = text_adapt_weight
+#         self.i_w = image_adapt_weight
+#         self.levels = levels
+#
+#         # 图像适配器
+#         layer_adapters = nn.ModuleList(
+#             [SimpleAdapter(1024, 1024) for _ in range(image_adapt_until)]
+#         )
+#         seg_proj = nn.ModuleList(
+#             [SimpleProj(1024, 768, relu) for _ in range(len(levels))]
+#         )
+#         det_proj = SimpleProj(1024, 768, relu)
+#         self.image_adapter = nn.ModuleDict(
+#             {
+#                 "layer_adapters": layer_adapters,
+#                 "seg_proj": seg_proj,
+#                 "det_proj": det_proj,
+#             }
+#         )
+#
+#         # 文本适配器
+#         self.text_adapter = nn.ModuleList(
+#             [SimpleAdapter(768, 768) for _ in range(text_adapt_until)]
+#             + [SimpleProj(768, 768, relu=True)]
+#         )
+#
+#         # 初始化双向模态融合模块
+#         self.bi_fusion = LightBiMAFusion(
+#             img_channels=1024,
+#             txt_channels=768,
+#             mid_channels=fusion_mid_channels,
+#             attn_size=fusion_attn_size
+#         )
+#
+#         # 添加融合特征投影层
+#         self.fusion_proj = nn.Conv2d(fusion_mid_channels, 1024, kernel_size=1)
+#
+#         self._init_weights_()
+#
+#     def _init_weights_(self):
+#         for p in self.image_adapter.parameters():
+#             if p.dim() > 1:
+#                 nn.init.xavier_uniform_(p)
+#         for p in self.text_adapter.parameters():
+#             if p.dim() > 1:
+#                 nn.init.xavier_uniform_(p)
+#         # 初始化融合模块参数
+#         for p in self.bi_fusion.parameters():
+#             if p.dim() > 1:
+#                 nn.init.xavier_uniform_(p)
+#         # 初始化融合投影层
+#         nn.init.xavier_uniform_(self.fusion_proj.weight)
+#         if self.fusion_proj.bias is not None:
+#             nn.init.zeros_(self.fusion_proj.bias)
+#
+#     def forward_original(self, x, modality="visual"):
+#         if modality == "visual":
+#             cls_features, patch_features = self.clipmodel.encode_image(x, [24])
+#             patch_features = [
+#                 self.clipmodel.visual._global_pool(t)[1] for t in patch_features
+#             ]
+#             patch_features = [self.clipmodel.visual.ln_post(t) for t in patch_features]
+#             patch_features = [t @ self.clipmodel.visual.proj for t in patch_features]
+#             return patch_features, cls_features
+#         else:
+#             raise ValueError("modality must be visual")
+#
+#     def forward(self, x, text_feat=None):
+#         # 图像特征提取
+#         x = self.image_encoder.conv1(x)
+#         x = x.reshape(x.shape[0], x.shape[1], -1)
+#         x = x.permute(0, 2, 1)
+#
+#         x = torch.cat(
+#             [
+#                 self.image_encoder.class_embedding.to(x.dtype)
+#                 + torch.zeros(
+#                     x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device
+#                 ),
+#                 x,
+#             ],
+#             dim=1,
+#         )
+#         x = x + self.image_encoder.positional_embedding.to(x.dtype)
+#
+#         x = self.image_encoder.patch_dropout(x)
+#         x = self.image_encoder.ln_pre(x)
+#
+#         x = x.permute(1, 0, 2)
+#
+#         tokens = []
+#         for i in range(24):
+#             x, attn = self.image_encoder.transformer.resblocks[i](x, attn_mask=None)
+#             if i < self.image_adapt_until:
+#                 adapt_out = self.image_adapter["layer_adapters"][i](x)
+#                 adapt_out = (
+#                         adapt_out
+#                         * x.norm(dim=-1, keepdim=True)
+#                         / adapt_out.norm(dim=-1, keepdim=True)
+#                 )
+#                 x = self.i_w * adapt_out + (1 - self.i_w) * x
+#             if i + 1 in self.levels:
+#                 tokens.append(x[1:, :, :])
+#
+#         x = x.permute(1, 0, 2)
+#         tokens = [t.permute(1, 0, 2) for t in tokens]
+#         tokens = [self.image_encoder.ln_post(t) for t in tokens]
+#
+#         # 如果提供了文本特征，则进行双向模态融合
+#         if text_feat is not None:
+#             # 调整特征形状以适应融合模块 (B, N, C) -> (B, C, H, W)
+#             B, N, C_img = tokens[-1].shape
+#             H = W = int(N ** 0.5)
+#             img_feat_2d = tokens[-1].permute(0, 2, 1).view(B, C_img, H, W)
+#
+#             # 文本特征形状调整
+#             B, C_txt, _ = text_feat.shape
+#             txt_feat_2d = text_feat.unsqueeze(-1).repeat(1, 1, H, W)  # 扩展到空间维度
+#
+#             # 双向融合
+#             fused_img, fused_txt = self.bi_fusion(img_feat_2d, txt_feat_2d)
+#
+#             # 投影融合特征到原始通道数
+#             fused_img = self.fusion_proj(fused_img)
+#
+#             # 恢复形状 (B, C, H, W) -> (B, N, C)
+#             fused_img = fused_img.view(B, 1024, N).permute(0, 2, 1)
+#
+#             # 残差连接
+#             tokens[-1] = tokens[-1] + fused_img
+#
+#         # 后续处理
+#         seg_tokens = [
+#             self.image_adapter["seg_proj"][i](t) for i, t in enumerate(tokens)
+#         ]
+#         seg_tokens = [F.normalize(t, dim=-1) for t in seg_tokens]
+#         det_token = self.image_adapter["det_proj"](tokens[-1])
+#         det_token = F.normalize(det_token, dim=-1).mean(1)
+#         return seg_tokens, det_token
+#
+#     def encode_text(self, text, adapt_text=True):
+#         if not adapt_text:
+#             return self.clipmodel.encode_text(text)
+#         cast_dtype = self.clipmodel.transformer.get_cast_dtype()
+#         x = self.clipmodel.token_embedding(text).to(
+#             cast_dtype
+#         )  # [batch_size, n_ctx, d_model]
+#
+#         x = x + self.clipmodel.positional_embedding.to(cast_dtype)
+#         x = x.permute(1, 0, 2)  # NLD -> LND
+#
+#         for i in range(12):
+#             x, attn = self.clipmodel.transformer.resblocks[i](
+#                 x, attn_mask=self.clipmodel.attn_mask
+#             )
+#             if i < self.text_adapt_until:
+#                 adapt_out = self.text_adapter[i](x)
+#                 adapt_out = (
+#                         adapt_out
+#                         * x.norm(dim=-1, keepdim=True)
+#                         / adapt_out.norm(dim=-1, keepdim=True)
+#                 )
+#                 x = self.t_w * adapt_out + (1 - self.t_w) * x
+#         x = x.permute(1, 0, 2)  # LND -> NLD
+#         x = self.clipmodel.ln_final(x)  # [batch_size, n_ctx, transformer.width]
+#         # 文本特征适配
+#         txt_feat = self.text_adapter[-1](x[torch.arange(x.shape[0]), text.argmax(dim=-1)])
+#         return txt_feat
 
 
 
