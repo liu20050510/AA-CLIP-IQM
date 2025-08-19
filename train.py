@@ -115,18 +115,22 @@ def train_text_adapter(
 
 
 def train_image_adapter(
-    model: nn.Module,
-    text_embeddings: torch.Tensor,
-    train_loader: DataLoader,
-    optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler,
-    device: str,
-    start_epoch: int,
-    save_path: str,
-    image_epoch: int,
-    img_size: int,
-    logger: logging.Logger,
+        model: nn.Module,
+        text_embeddings: torch.Tensor,
+        train_loader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        scheduler: torch.optim.lr_scheduler,
+        device: str,
+        start_epoch: int,
+        save_path: str,
+        image_epoch: int,
+        img_size: int,
+        logger: logging.Logger,
 ):
+    # 调整IQM相关损失权重，降低IQM损失权重以稳定训练
+    iqm_weight = 0.2  # 从0.8降低到0.2
+    text_weight = 0.8  # 从0.2提高到0.8
+
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
         loss_list = []
@@ -135,23 +139,72 @@ def train_image_adapter(
             mask = input_data["mask"].to(device)
             label = input_data["label"].to(device)
             B, C, H, W = image.shape
-            # forward text
+
+            # 获取文本嵌入
             class_names = input_data["class_name"]
             epoch_text_feature = torch.stack(
                 [text_embeddings[class_name] for class_name in class_names], dim=0
             )
 
-            # forward image
-            patch_features, det_feature = model(image)
-            # calculate similarity and get prediction
+            # 前向传播，包含IQM输出
+            patch_features, det_feature, iqm_outputs = model(image, text_embeddings=epoch_text_feature)
+
+            # 计算原始损失
             loss = 0.0
             det_feature = det_feature.unsqueeze(1)
             cls_preds = torch.matmul(det_feature, epoch_text_feature)[:, 0]
-            loss += F.cross_entropy(cls_preds, label)
+            loss += F.cross_entropy(cls_preds, label) * 0.5  # 降低分类损失权重
+
+            # 计算文本异常图损失
+            text_anomaly_maps = []
             for f in patch_features:
-                # text-image alignment
                 patch_preds = calculate_similarity_map(f, epoch_text_feature, img_size)
-                loss += calculate_seg_loss(patch_preds, mask)  # backward
+                text_anomaly_maps.append(patch_preds)
+                loss += calculate_seg_loss(patch_preds, mask) * text_weight * 0.5  # 调整权重
+
+            # 计算IQM异常图损失
+            if iqm_outputs is not None:
+                final_query_embedding = iqm_outputs.last_hidden_state
+                # 分离正常和异常查询嵌入
+                norm_query = final_query_embedding[:, 0, :]  # 正常查询
+                abnorm_query = final_query_embedding[:, 1, :]  # 异常查询
+
+                # 计算查询异常图
+                for i, f in enumerate(patch_features):
+                    # 计算与正常和异常查询的相似度
+                    norm_sim = F.cosine_similarity(f, norm_query.unsqueeze(1), dim=-1)
+                    abnorm_sim = F.cosine_similarity(f, abnorm_query.unsqueeze(1), dim=-1)
+
+                    # 计算异常概率
+                    anomaly_diff = abnorm_sim - norm_sim
+                    iqm_preds = torch.sigmoid(anomaly_diff)
+
+                    # 将1D的patch序列重塑为2D特征图
+                    B, L = iqm_preds.shape
+                    H = int(np.sqrt(L))
+                    # 确保L是完全平方数
+                    assert H * H == L, f"L={L} is not a perfect square"
+
+                    # 创建两个通道：正常预测和异常预测
+                    # 正常预测是1-异常概率，异常预测是异常概率
+                    normal_pred = (1 - iqm_preds).view(B, 1, H, H)
+                    abnormal_pred = iqm_preds.view(B, 1, H, H)
+                    iqm_preds_two_channel = torch.cat([normal_pred, abnormal_pred], dim=1)
+
+                    iqm_anomaly_map = F.interpolate(
+                        iqm_preds_two_channel,
+                        size=(img_size, img_size),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+
+                    # 添加到损失中，使用较小的权重
+                    loss += calculate_seg_loss(iqm_anomaly_map, mask) * iqm_weight * 0.5
+
+            # 梯度裁剪防止梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # 反向传播
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -195,10 +248,10 @@ def main():
         choices=["few_shot", "full_shot"],
     )
     parser.add_argument("--shot", type=int, default=32, help="number of shots (0 means full shot)")
-    parser.add_argument("--text_batch_size", type=int, default=2)
-    parser.add_argument("--image_batch_size", type=int, default=1)
+    parser.add_argument("--text_batch_size", type=int, default=16)
+    parser.add_argument("--image_batch_size", type=int, default=2)
     parser.add_argument("--text_epoch", type=int, default=5, help="epochs for stage1")
-    parser.add_argument("--image_epoch", type=int, default=6, help="epochs for stage2")
+    parser.add_argument("--image_epoch", type=int, default=20, help="epochs for stage2")
     parser.add_argument("--text_lr", type=float, default=0.00001, help="learning rate for stage1")
     parser.add_argument("--image_lr", type=float, default=0.0005, help="learning rate for stage2")
     parser.add_argument(
@@ -213,6 +266,12 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    # 调整IQM超参数以提升性能
+    parser.add_argument("--iqm_hidden_size", type=int, default=512)  # 降低维度以减少过拟合
+    parser.add_argument("--iqm_num_layers", type=int, default=3)  # 减少层数
+    parser.add_argument("--iqm_num_heads", type=int, default=8)
+    parser.add_argument("--iqm_weight", type=float, default=0.5)  # 降低IQM权重
+
 
     args = parser.parse_args()
     # ========================================================
@@ -265,13 +324,20 @@ def main():
         lr=args.text_lr,
         betas=(0.5, 0.999),
     )
-    image_optimizer = torch.optim.Adam(
-        model.image_adapter.parameters(),
-        lr=args.image_lr,
-        betas=(0.5, 0.999),
-    )
-    # text_scheduler = MultiStepLR(text_optimizer, milestones=[400], gamma=0.1)
-    image_scheduler = MultiStepLR(image_optimizer, milestones=[16000, 32000], gamma=0.5)
+
+    # 改进优化器设置，使用不同的学习率和权重衰减
+    image_params = list(model.image_adapter.parameters())
+    iqm_params = list(model.iqm.parameters()) + list(model.class_query_mlp.parameters()) + \
+                 list(model.query_adapters.parameters())
+
+    # 不直接添加可能为None的参数，而是在训练过程中动态处理
+    image_optimizer = torch.optim.AdamW([
+        {'params': image_params, 'lr': args.image_lr, 'weight_decay': 1e-4},
+        {'params': iqm_params, 'lr': args.image_lr * 0.1, 'weight_decay': 1e-3}  # IQM模块使用更低学习率和更高权重衰减
+    ], betas=(0.9, 0.999))
+
+    # 修改学习率调度器，使用更温和的衰减策略
+    image_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(image_optimizer, T_max=args.image_epoch, eta_min=1e-6)
     # ========================================================
     # load checkpoints if exists
     text_file = glob(args.save_path + "/text_adapter.pth")
