@@ -12,20 +12,27 @@ from .constants import CLASS_NAMES, DATA_PATH, DOMAINS
 
 class BaseDataset(Dataset):
     def __init__(
-        self,
-        data_path: str,
-        meta_path: str,
-        img_size: int,
-        text: bool = False,
+            self,
+            data_path: str,
+            meta_path: str,
+            img_size: int,
+            text: bool = False,
+            shot: int = -1,
     ):
         self.data_path = data_path
         self.img_size = img_size
         self.text = text
+        self.shot = shot
         self.meta = []
+        self.normal_meta = []  # 存储正常样本元数据
         self.full_shot = "full-shot" in meta_path
         with open(meta_path, "r") as f:
             for line in f:
-                self.meta.append(json.loads(line))
+                meta_item = json.loads(line)
+                self.meta.append(meta_item)
+                # 如果是正常样本，也添加到正常样本列表中
+                if meta_item["label"] == 0:  # 正常样本
+                    self.normal_meta.append(meta_item)
 
         self.transforms_list = [
             transforms.RandomApply(
@@ -65,6 +72,7 @@ class BaseDataset(Dataset):
             [
                 transforms.Resize((img_size, img_size), Image.NEAREST),
                 transforms.ToTensor(),
+                # 调整为单通道
             ]
         )
 
@@ -100,28 +108,43 @@ class BaseDataset(Dataset):
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
         }
+
+        # 在全样本和少样本场景下，为异常样本添加prompt图像
+        if (self.shot > 0 or self.full_shot) and meta["label"] == 1 and len(self.normal_meta) > 0:
+            # 随机选择正常样本作为prompt
+            prompt_meta = random.choice(self.normal_meta)
+            prompt_img_path = os.path.join(self.data_path, prompt_meta["image_path"])
+            prompt_img = Image.open(prompt_img_path).convert("RGB")
+            prompt_img = self.transform_x(prompt_img)
+            inputs["prompt_image"] = prompt_img
+
         return inputs
 
 
 class BaseSingleClassDataset(Dataset):
     def __init__(
-        self,
-        data_path: str,
-        meta_path: str,
-        img_size: int,
-        class_name: str,
-        logger=None,
+            self,
+            data_path: str,
+            meta_path: str,
+            img_size: int,
+            class_name: str,
+            logger=None,
+            shot: int = -1,  # 添加shot参数
     ):
 
         assert class_name is not None, "class_name should be provided"
         self.data_path = data_path
         self.img_size = img_size
         self.meta = []
+        self.normal_meta = []  # 存储正常样本元数据
         with open(meta_path, "r") as f:
             for line in f:
                 m = json.loads(line.strip())
                 if m["class_name"] == class_name:
                     self.meta.append(m)
+                    # 如果是正常样本，也添加到正常样本列表中
+                    if m["label"] == 0:  # 正常样本
+                        self.normal_meta.append(m)
 
         # Define transforms
         self.transform_x = transforms.Compose(
@@ -140,6 +163,9 @@ class BaseSingleClassDataset(Dataset):
                 transforms.ToTensor(),
             ]
         )
+
+        self.shot = shot  # 保存shot参数
+        self.full_shot = "full-shot" in meta_path  # 检查是否是全样本模式
 
         # logging
         if logger:
@@ -169,16 +195,26 @@ class BaseSingleClassDataset(Dataset):
             "file_name": meta["image_path"],
             "class_name": meta["class_name"],
         }
+
+        # 在全样本和少样本场景下，为异常样本添加prompt图像
+        if (self.shot > 0 or self.full_shot) and meta["label"] == 1 and len(self.normal_meta) > 0:
+            # 随机选择正常样本作为prompt
+            prompt_meta = random.choice(self.normal_meta)
+            prompt_img_path = os.path.join(self.data_path, prompt_meta["image_path"])
+            prompt_img = Image.open(prompt_img_path).convert("RGB")
+            prompt_img = self.transform_x(prompt_img)
+            inputs["prompt_image"] = prompt_img
+
         return inputs
 
 
 def get_dataset(
-    dataset_name: str,
-    img_size: int,
-    training_mode: str,
-    shot: int = -1,
-    stage: str = "train",
-    logger=None,
+        dataset_name: str,
+        img_size: int,
+        training_mode: str,
+        shot: int = -1,
+        stage: str = "train",
+        logger=None,
 ):
     if "Med" not in dataset_name:
         assert dataset_name in DATA_PATH, (
@@ -197,8 +233,8 @@ def get_dataset(
             )
 
         data_path = DATA_PATH[dataset_name.split("-")[0]]
-        text_dataset = BaseDataset(data_path, meta_path, img_size, text=True)
-        image_dataset = BaseDataset(data_path, meta_path, img_size, text=False)
+        text_dataset = BaseDataset(data_path, meta_path, img_size, text=True, shot=shot)
+        image_dataset = BaseDataset(data_path, meta_path, img_size, text=False, shot=shot)
         return text_dataset, image_dataset
     elif stage == "test":
         meta_path = os.path.join("./dataset/metadata", dataset_name, "full-shot.jsonl")
@@ -211,6 +247,7 @@ def get_dataset(
                 img_size=img_size,
                 class_name=class_name,
                 logger=logger,
+                shot=shot,  # 传递shot参数
             )
             datasets[class_name] = image_dataset
         return datasets
@@ -225,6 +262,7 @@ def get_dataset(
                 img_size=img_size,
                 class_name=class_name,
                 logger=None,
+                shot=shot,  # 传递shot参数
             )
             datasets[class_name] = image_dataset
         return datasets

@@ -231,23 +231,51 @@ def calculate_seg_loss(patch_preds, mask):
 
 
 def metrics_eval(
-    pixel_label: np.ndarray,
-    image_label: np.ndarray,
-    pixel_preds: np.ndarray,
-    image_preds: np.ndarray,
-    class_names: str,
-    domain: str,
+        pixel_label: np.ndarray,
+        image_label: np.ndarray,
+        pixel_preds: np.ndarray,
+        image_preds: np.ndarray,
+        class_names: str,
+        domain: str,
 ):
+    print(f"pixel_label.shape: {pixel_label.shape}")
+    print(f"image_label.shape: {image_label.shape}")
+    print(f"pixel_preds.shape: {pixel_preds.shape}")
+    print(f"image_preds.shape: {image_preds.shape}")
+
     if pixel_preds.max() != 1:
         pixel_preds = (pixel_preds - pixel_preds.min()) / (
-            pixel_preds.max() - pixel_preds.min()
+                pixel_preds.max() - pixel_preds.min()
         )
     if image_preds.max() != 1:
         image_preds = (image_preds - image_preds.min()) / (
-            image_preds.max() - image_preds.min()
+                image_preds.max() - image_preds.min()
         )
 
+    # 确保 pixel_preds 是 3D 张量 (batch_size, height, width)
+    if pixel_preds.ndim == 4 and pixel_preds.shape[1] == 1:
+        # 如果是 (batch_size, 1, height, width) 形状，去掉通道维度
+        pixel_preds = pixel_preds.squeeze(1)
+    elif pixel_preds.ndim == 2:
+        # 如果是 (batch_size, pixels) 形状，需要重塑
+        batch_size = pixel_preds.shape[0]
+        pixels = pixel_preds.shape[1]
+        side = int(pixels ** 0.5)
+        if side * side == pixels:
+            pixel_preds = pixel_preds.reshape(batch_size, side, side)
+
+    # 确保 image_preds 是 1D 张量 (batch_size,)
+    # 只取第二维的第一个元素，因为我们只关心与异常相关的预测
+    if image_preds.ndim == 2 and image_preds.shape[1] == 2:
+        image_preds = image_preds[:, 0]  # 或者 image_preds[:, 1]，取决于哪个是异常预测
+    elif image_preds.ndim > 1:
+        image_preds = image_preds.flatten()
+
+    print(f"After processing - pixel_preds.shape: {pixel_preds.shape}")
+    print(f"After processing - image_preds.shape: {image_preds.shape}")
+
     pmax_pred = pixel_preds.max(axis=(1, 2))
+    print(f"pmax_pred.shape: {pmax_pred.shape}")
     if domain != "Medical":
         image_preds = pmax_pred * 0.5 + image_preds * 0.5
     else:

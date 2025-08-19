@@ -20,6 +20,8 @@ from forward_utils import (
     metrics_eval,
     visualize,
 )
+# 新增导入HSF模块
+from model.HSF import HybridSemanticFusion
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -55,8 +57,11 @@ def get_predictions(
         test_loader: DataLoader,
         device: str,
         img_size: int,
+        k_clusters: int,  # 新增参数：聚类数量
         dataset: str = "MVTec",
 ):
+    # 初始化HSF模块
+    hsf = HybridSemanticFusion(k_clusters=k_clusters)
     masks = []
     labels = []
     preds = []
@@ -75,20 +80,14 @@ def get_predictions(
         file_names.extend(file_name)
         # get text
         epoch_text_feature = class_text_embeddings
-
-        # 修复：正确获取异常文本向量
-        # 文本嵌入形状为 (2, 768) - 第一个是正常文本，第二个是异常文本
-        text_feat_batch = epoch_text_feature[1]  # 直接取第二个元素（异常文本向量）
-        text_feat_batch = text_feat_batch.unsqueeze(0)  # [1, 768]
-        text_feat_batch = text_feat_batch.expand(image.size(0), -1)  # [B, 768]
-
-        # forward image (传入文本特征)
-        patch_features, det_feature = model(image, text_feat=text_feat_batch)
-
+        # forward image
+        patch_features, det_feature = model(image)
         # calculate similarity and get prediction
-        pred = det_feature @ epoch_text_feature
-        pred = (pred[:, 1] + 1) / 2
-        preds_image.append(pred.cpu().numpy())
+        # cls_preds = []
+        # pred = det_feature @ epoch_text_feature
+        # pred = (pred[:, 1] + 1) / 2
+        # preds_image.append(pred.cpu().numpy())
+        # 2. 计算像素级异常图（复用原有逻辑）
         patch_preds = []
         for f in patch_features:
             # f: bs,patch_num,768
@@ -96,6 +95,19 @@ def get_predictions(
                 f, epoch_text_feature, img_size, test=True, domain=DOMAINS[dataset]
             )
             patch_preds.append(patch_pred)
+
+        # 3. HSF模块：聚合异常区域语义信息
+        # 调整输入形状：patch_features转为[num_layers, B, L, C]，patch_preds转为[num_layers, B, 2, H, W]
+        patch_tokens = torch.stack(patch_features, dim=0)  # [num_layers, B, L, C]
+        anomaly_maps = torch.stack(patch_preds, dim=0)  # [num_layers, B, 2, H, W]
+        clustered_feature = hsf(patch_tokens, anomaly_maps)  # [B, C]：语义丰富的图像嵌入
+
+        # 4. 基于HSF输出计算图像级异常分数（替代原det_feature）
+        pred = clustered_feature @ epoch_text_feature  # [B, 2]
+        pred = (pred[:, 1] + 1) / 2  # 异常类分数归一化
+        preds_image.append(pred.cpu().numpy())
+
+        # 像素级预测保持不变
         patch_preds = torch.cat(patch_preds, dim=1).sum(1).cpu().numpy()
         preds.append(patch_preds)
     masks = np.concatenate(masks, axis=0)
@@ -119,7 +131,7 @@ def main():
     # testing
     parser.add_argument("--dataset", type=str, default="MVTec")
     parser.add_argument("--shot", type=int, default=4)
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=32)
     # exp
     parser.add_argument("--seed", type=int, default=111)
     parser.add_argument("--save_path", type=str, default="ckpt/baseline")
@@ -129,6 +141,8 @@ def main():
     parser.add_argument("--image_adapt_weight", type=float, default=0.1)
     parser.add_argument("--text_adapt_until", type=int, default=3)
     parser.add_argument("--image_adapt_until", type=int, default=6)
+    # 新增参数：聚类数量
+    parser.add_argument("--k_clusters", type=int, default=4, help="number of clusters for HSF module")
 
     args = parser.parse_args()
     # ========================================================
@@ -229,6 +243,7 @@ def main():
                     test_loader=image_dataloader,
                     device=device,
                     img_size=args.img_size,
+                    k_clusters=args.k_clusters,  # 新增
                     dataset=args.dataset,
                 )
             # ========================================================
