@@ -50,25 +50,9 @@ class IQM_MultiHeadAttention(nn.Module):
         if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
             self.max_position_embeddings = config.max_position_embeddings
             self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
-        self.save_attention = False
 
-        # 改进缩放因子初始化
-        self.scale = nn.Parameter(torch.ones(1) * 0.1)  # 初始化为较小值以避免训练初期不稳定
-
-        # 添加注意力温度参数，用于控制注意力分布的锐度
-        self.temperature = nn.Parameter(torch.ones(1))
-
-    def save_attn_gradients(self, attn_gradients):
-        self.attn_gradients = attn_gradients
-
-    def get_attn_gradients(self):
-        return self.attn_gradients
-
-    def save_attention_map(self, attention_map):
-        self.attention_map = attention_map
-
-    def get_attention_map(self):
-        return self.attention_map
+        # 简化缩放因子初始化
+        self.scale = math.sqrt(self.attention_head_size)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -104,7 +88,6 @@ class IQM_MultiHeadAttention(nn.Module):
             value_layer = self.transpose_for_scores(self.value(hidden_states))
 
         mixed_query_layer = self.query(hidden_states)
-
         query_layer = self.transpose_for_scores(mixed_query_layer)
 
         past_key_value = (key_layer, value_layer)
@@ -128,13 +111,7 @@ class IQM_MultiHeadAttention(nn.Module):
                 relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
                 attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
 
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-
-        # 应用可学习的缩放因子
-        attention_scores = attention_scores * self.scale
-
-        # 应用温度参数控制注意力分布锐度
-        attention_scores = attention_scores / self.temperature
+        attention_scores = attention_scores / self.scale
 
         if attention_mask is not None:
             # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
@@ -142,10 +119,6 @@ class IQM_MultiHeadAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.Softmax(dim=-1)(attention_scores)
-
-        if is_cross_attention and self.save_attention:
-            self.save_attention_map(attention_probs)
-            attention_probs.register_hook(self.save_attn_gradients)
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -162,7 +135,6 @@ class IQM_MultiHeadAttention(nn.Module):
         context_layer = context_layer.view(*new_context_layer_shape)
 
         outputs = (context_layer, attention_probs) if output_attentions else (context_layer,)
-
         outputs = outputs + (past_key_value,)
         return outputs
 
@@ -174,24 +146,10 @@ class IQM_SelfOutput(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # 添加残差连接缩放因子
-        self.residual_scale = nn.Parameter(torch.ones(1))
-
-        # 添加门控机制
-        self.gate = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Sigmoid()
-        )
-
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-
-        # 应用门控机制
-        gate_value = self.gate(input_tensor)
-        gated_hidden_states = gate_value * hidden_states
-
-        hidden_states = self.LayerNorm(gated_hidden_states + self.residual_scale * input_tensor)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -266,24 +224,10 @@ class IQM_Output(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        # 添加残差连接缩放因子
-        self.residual_scale = nn.Parameter(torch.ones(1))
-
-        # 添加门控机制
-        self.gate = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Sigmoid()
-        )
-
     def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-
-        # 应用门控机制
-        gate_value = self.gate(input_tensor)
-        gated_hidden_states = gate_value * hidden_states
-
-        hidden_states = self.LayerNorm(gated_hidden_states + self.residual_scale * input_tensor)
+        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -303,20 +247,11 @@ class IQMLayer(nn.Module):
         else:
             self.has_cross_attention = False
 
-        if config.use_qformer_text_input:
-            self.intermediate = IQM_Intermediate(config)
-            self.output = IQM_Output(config)
+        self.intermediate = IQM_Intermediate(config)
+        self.output = IQM_Output(config)
 
         self.intermediate_query = IQM_Intermediate(config)
         self.output_query = IQM_Output(config)
-
-        # 添加层归一化
-        self.post_attention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        if self.has_cross_attention:
-            self.post_crossattention_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
-        # 添加可学习的层权重
-        self.layer_weights = nn.Parameter(torch.ones(3))
 
     def forward(
             self,
@@ -344,9 +279,6 @@ class IQMLayer(nn.Module):
 
         present_key_value = self_attention_outputs[-1]
 
-        # 添加层归一化
-        attention_output = self.post_attention_layernorm(attention_output)
-
         if query_length > 0:
             query_attention_output = attention_output[:, :query_length, :]
 
@@ -363,9 +295,6 @@ class IQMLayer(nn.Module):
                 )
                 query_attention_output_cross = cross_attention_outputs[0][:, :query_length, :]
 
-                # 添加层归一化
-                query_attention_output_cross = self.post_crossattention_layernorm(query_attention_output_cross)
-
                 text_cross_attention_outputs = self.text_crossattention(
                     query_attention_output_cross,
                     attention_mask=None,
@@ -378,12 +307,11 @@ class IQMLayer(nn.Module):
                 # add cross attentions if we output attention weights
                 outputs = outputs + text_cross_attention_outputs[1:-1]
 
-                # 加权融合三种注意力输出
-                weights = torch.softmax(self.layer_weights, dim=0)
+                # 简化融合策略
                 query_attention_output = (
-                        weights[0] * query_attention_output +
-                        weights[1] * query_attention_output_cross +
-                        weights[2] * query_attention_output_text
+                        0.4 * query_attention_output +
+                        0.3 * query_attention_output_cross +
+                        0.3 * query_attention_output_text
                 )
 
             layer_output = apply_chunking_to_forward(
@@ -529,9 +457,9 @@ class IQMConfig(PretrainedConfig):
             self,
             vocab_size=30522,
             hidden_size=768,
-            num_hidden_layers=4,
+            num_hidden_layers=2,
             num_attention_heads=8,
-            intermediate_size=3072,
+            intermediate_size=2048,
             hidden_act="gelu",
             hidden_dropout_prob=0.1,
             attention_probs_dropout_prob=0.1,
@@ -581,22 +509,6 @@ class IQM(PreTrainedModel):
         self.encoder = IQMEncoder(config)
 
         self.post_init()
-
-        # 添加查询特征增强模块
-        self.query_enhancement = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size, config.hidden_size),
-            nn.Sigmoid()
-        )
-
-        # 添加上下文感知查询增强
-        self.context_aware_enhancement = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size // 2),
-            nn.ReLU(),
-            nn.Linear(config.hidden_size // 2, config.hidden_size),
-            nn.Tanh()
-        )
 
     def get_input_embeddings(self):
         return self.embeddings.word_embeddings
@@ -700,17 +612,7 @@ class IQM(PreTrainedModel):
             query_length if query_length is not None else query_embeds.shape[1] if query_embeds is not None else 0
         )
 
-        # 增强查询嵌入
-        enhanced_query = query_embeds * self.query_enhancement(query_embeds)
-
-        # 添加上下文感知增强
-        if encoder_hidden_states is not None:
-            # 使用编码器隐藏状态计算上下文信息
-            context_info = torch.mean(encoder_hidden_states, dim=1, keepdim=True)  # [batch_size, 1, hidden_size]
-            context_aware_weights = self.context_aware_enhancement(context_info)  # [batch_size, 1, hidden_size]
-            enhanced_query = enhanced_query * (1 + context_aware_weights)  # 应用上下文感知增强
-
-        embedding_output = self.layernorm(enhanced_query)
+        embedding_output = self.layernorm(query_embeds)
         embedding_output = self.dropout(embedding_output)
 
         input_shape = embedding_output.size()[:-1]

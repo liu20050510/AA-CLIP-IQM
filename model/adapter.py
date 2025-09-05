@@ -19,7 +19,7 @@ class AdaptedCLIP(nn.Module):
             relu: bool = True,
             # IQM相关参数
             iqm_hidden_size: int = 768,
-            iqm_num_layers: int = 4,
+            iqm_num_layers: int = 2,
             iqm_num_heads: int = 8, **kwargs,
     ):
         super().__init__()
@@ -86,8 +86,8 @@ class AdaptedCLIP(nn.Module):
         self.pos_embedding = self._create_positional_embedding(max_len=512, d_model=iqm_hidden_size)
 
         # 添加可学习的融合权重参数，并增加约束
-        self.visual_weight = nn.Parameter(torch.tensor(0.5))
-        self.text_weight = nn.Parameter(torch.tensor(0.5))
+        self.visual_weight = nn.Parameter(torch.tensor(0.6))
+        self.text_weight = nn.Parameter(torch.tensor(0.4))
 
         # 添加IQM输出的正则化参数
         self.iqm_dropout = nn.Dropout(0.1)
@@ -257,8 +257,8 @@ class AdaptedCLIP(nn.Module):
             iqm_outputs = self.iqm(
                 query_embeds=query_embeds,
                 query_length=query_embeds.shape[1],
-                encoder_hidden_states=projected_concatenated_visual * visual_weight_normalized,
-                text_encoder_hidden_states=projected_text_embeddings * text_weight_normalized,
+                encoder_hidden_states=projected_concatenated_visual,
+                text_encoder_hidden_states=projected_text_embeddings,
             )
 
             # 对IQM输出进行正则化

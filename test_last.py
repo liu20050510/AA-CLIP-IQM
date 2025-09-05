@@ -63,9 +63,9 @@ def get_predictions(
     preds = []
     preds_image = []
     file_names = []
-    # 新增IQM权重参数
-    iqm_weight = 0.8
-    text_weight = 0.2
+    # 调整权重参数，降低IQM权重以提升整体性能
+    iqm_weight = 0.4  # 从0.7降低到0.4
+    text_weight = 0.6  # 从0.3提高到0.6
 
     for input_data in tqdm(test_loader):
         image = input_data["image"].to(device)
@@ -107,6 +107,16 @@ def get_predictions(
             abnorm_query = final_query_embedding[:, 1, :]
 
             for f in patch_features:
+                # 解决维度不匹配问题 - 将query向量维度调整为与f相同
+                if norm_query.shape[-1] != f.shape[-1]:
+                    # 创建一个临时的线性投影层来调整维度
+                    # 使用patch_features的第一个样本的设备信息
+                    device = f.device
+                    proj_layer = nn.Linear(norm_query.shape[-1], f.shape[-1]).to(device)
+                    with torch.no_grad():
+                        norm_query = proj_layer(norm_query)
+                        abnorm_query = proj_layer(abnorm_query)
+
                 norm_sim = F.cosine_similarity(f, norm_query.unsqueeze(1), dim=-1)
                 abnorm_sim = F.cosine_similarity(f, abnorm_query.unsqueeze(1), dim=-1)
                 iqm_pred = torch.sigmoid(abnorm_sim - norm_sim)
@@ -127,21 +137,13 @@ def get_predictions(
                 )
                 iqm_anomaly_maps.append(iqm_pred)
 
-        # 融合异常图 - 改进融合策略
+        # 融合异常图 - 改进融合策略，使用更稳定的权重
         if iqm_anomaly_maps:
-            # 使用动态权重而非固定权重
-            # 根据特征的相关性动态计算权重
+            # 使用固定权重而非动态权重，提高稳定性
             text_map = torch.cat(text_anomaly_maps, dim=1).sum(1, keepdim=True)
             iqm_map = torch.cat(iqm_anomaly_maps, dim=1).sum(1, keepdim=True)
 
-            # 计算动态权重，增加数值稳定性
-            text_var = torch.var(text_map) + 1e-8  # 添加小值避免除零
-            iqm_var = torch.var(iqm_map) + 1e-8
-            total_var = text_var + iqm_var
-
-            text_weight = text_var / total_var
-            iqm_weight = iqm_var / total_var
-
+            # 使用更平衡的权重组合，避免过度依赖IQM
             final_map = text_map * text_weight + iqm_map * iqm_weight
         else:
             final_map = torch.cat(text_anomaly_maps, dim=1).sum(1)
@@ -182,9 +184,9 @@ def main():
     parser.add_argument("--image_adapt_until", type=int, default=6)
     # 调整IQM超参数以提升性能
     parser.add_argument("--iqm_hidden_size", type=int, default=512)  # 降低维度以减少过拟合
-    parser.add_argument("--iqm_num_layers", type=int, default=3)  # 减少层数
+    parser.add_argument("--iqm_num_layers", type=int, default=2)  # 减少层数
     parser.add_argument("--iqm_num_heads", type=int, default=8)
-    parser.add_argument("--iqm_weight", type=float, default=0.5)  # 降低IQM权重
+    parser.add_argument("--iqm_weight", type=float, default=0.7)  # 增加IQM权重
 
 
     args = parser.parse_args()
@@ -220,6 +222,9 @@ def main():
         text_adapt_until=args.text_adapt_until,
         image_adapt_until=args.image_adapt_until,
         relu=args.relu,
+        iqm_hidden_size=args.iqm_hidden_size,
+        iqm_num_layers=args.iqm_num_layers,
+        iqm_num_heads=args.iqm_num_heads,
     ).to(device)
     model.eval()
     # load checkpoints if exists

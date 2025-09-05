@@ -127,9 +127,9 @@ def train_image_adapter(
         img_size: int,
         logger: logging.Logger,
 ):
-    # 调整IQM相关损失权重，降低IQM损失权重以稳定训练
-    iqm_weight = 0.2  # 从0.8降低到0.2
-    text_weight = 0.8  # 从0.2提高到0.8
+    # 调整IQM相关损失权重，降低IQM损失权重以稳定训练并提升整体性能
+    iqm_weight = 0.4  # 从0.3提高到0.4，与测试时保持一致
+    text_weight = 0.6  # 从0.7降低到0.6，与测试时保持一致
 
     for epoch in range(start_epoch, image_epoch):
         logger.info(f"training image epoch {epoch}:")
@@ -171,9 +171,19 @@ def train_image_adapter(
 
                 # 计算查询异常图
                 for i, f in enumerate(patch_features):
+                    # 确保特征维度匹配，将查询投影到与视觉特征相同的维度
+                    if norm_query.size(-1) != f.size(-1):
+                        # 创建投影层将查询特征从512维投影到768维
+                        proj_layer = nn.Linear(norm_query.size(-1), f.size(-1)).to(f.device)
+                        norm_query_proj = proj_layer(norm_query)
+                        abnorm_query_proj = proj_layer(abnorm_query)
+                    else:
+                        norm_query_proj = norm_query
+                        abnorm_query_proj = abnorm_query
+
                     # 计算与正常和异常查询的相似度
-                    norm_sim = F.cosine_similarity(f, norm_query.unsqueeze(1), dim=-1)
-                    abnorm_sim = F.cosine_similarity(f, abnorm_query.unsqueeze(1), dim=-1)
+                    norm_sim = F.cosine_similarity(f, norm_query_proj.unsqueeze(1), dim=-1)
+                    abnorm_sim = F.cosine_similarity(f, abnorm_query_proj.unsqueeze(1), dim=-1)
 
                     # 计算异常概率
                     anomaly_diff = abnorm_sim - norm_sim
@@ -198,7 +208,7 @@ def train_image_adapter(
                         align_corners=False
                     )
 
-                    # 添加到损失中，使用较小的权重
+                    # 添加到损失中，使用适当权重
                     loss += calculate_seg_loss(iqm_anomaly_map, mask) * iqm_weight * 0.5
 
             # 梯度裁剪防止梯度爆炸
@@ -268,9 +278,9 @@ def main():
     parser.add_argument("--image_adapt_until", type=int, default=6)
     # 调整IQM超参数以提升性能
     parser.add_argument("--iqm_hidden_size", type=int, default=512)  # 降低维度以减少过拟合
-    parser.add_argument("--iqm_num_layers", type=int, default=3)  # 减少层数
+    parser.add_argument("--iqm_num_layers", type=int, default=2)  # 减少层数
     parser.add_argument("--iqm_num_heads", type=int, default=8)
-    parser.add_argument("--iqm_weight", type=float, default=0.5)  # 降低IQM权重
+    parser.add_argument("--iqm_weight", type=float, default=0.4)  # 降低IQM权重
 
 
     args = parser.parse_args()
@@ -316,6 +326,9 @@ def main():
         text_adapt_until=args.text_adapt_until,
         image_adapt_until=args.image_adapt_until,
         relu=args.relu,
+        iqm_hidden_size=args.iqm_hidden_size,
+        iqm_num_layers=args.iqm_num_layers,
+        iqm_num_heads=args.iqm_num_heads,
     ).to(device)
     model.eval()
     # set optimizer
